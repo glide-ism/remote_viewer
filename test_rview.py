@@ -167,6 +167,64 @@ def main():
     check("0 levels leaves the colormap alone",
           np.array_equal(R.level_lut("viridis", 0), R._cmap_array("viridis")))
 
+    print("\nlogarithmic scale")
+    lo, hi = 0.1, 1000.0
+    # a field laid out evenly in log space must come back as codes 0..255
+    ramp = np.exp(np.linspace(np.log(lo), np.log(hi), 256)).astype(np.float32).reshape(16, 16)
+    codes = np.flipud(R.quantize(ramp, lo, hi, log=True))
+    check("a log-spaced ramp encodes to every code exactly once",
+          np.array_equal(np.sort(codes.ravel()), np.arange(256)),
+          f"{len(np.unique(codes))} distinct codes")
+
+    vals = R.code_values(lo, hi, log=True)
+    back = vals[R.quantize(ramp, lo, hi, log=True)]
+    rel = np.max(np.abs(np.log(np.flipud(back)) - np.log(ramp)))
+    check("values round-trip within half a log quantum",
+          rel <= (np.log(hi) - np.log(lo)) / 255 / 2 + 1e-5, f"worst {rel:.2e} in log space")
+
+    # the point of encoding in log space: linear codes cannot resolve the low decades
+    low = np.array([[0.1, 0.2, 0.5, 1.0]], dtype=np.float32)
+    lin_codes = np.unique(R.quantize(low, lo, hi, log=False))
+    log_codes = np.unique(R.quantize(low, lo, hi, log=True))
+    check("a linear window collapses the bottom decade; a log one does not",
+          len(lin_codes) == 1 and len(log_codes) == 4,
+          f"linear {len(lin_codes)} code(s), log {len(log_codes)} for 0.1-1 out of 0.1-1000")
+
+    zero_neg = np.array([[0.0, -5.0, 1e-30, lo / 2]], dtype=np.float32)
+    check("zero and negative values sit below a log window, at code 0",
+          np.array_equal(R.quantize(zero_neg, lo, hi, log=True), np.zeros((1, 4), np.uint8)))
+
+    # both sides apply the same test, so a window log cannot use falls back
+    check("an impossible log window falls back to linear rather than blanking",
+          not R.use_log(0.0, 10.0, True) and not R.use_log(-1.0, 10.0, True)
+          and not R.use_log(1.0, 1.0, True) and R.use_log(1.0, 10.0, True))
+    flat = np.linspace(0, 10, 256, dtype=np.float32).reshape(16, 16)
+    check("and then encodes identically to a linear request",
+          np.array_equal(R.quantize(flat, 0.0, 10.0, log=True),
+                         R.quantize(flat, 0.0, 10.0, log=False)))
+
+    hid = R.hidden_codes(lo, hi, 0.1, log=True)
+    check("hide-below on a log window hides only the floor",
+          hid[0] and not hid[1], f"{int(hid.sum())} of 256 codes")
+    check("a log threshold tolerates a float32 stored value",
+          R.hidden_codes(lo, hi, 0.1, log=True)[
+              int(R.quantize(np.float32([[0.1]]), lo, hi, log=True)[0, 0])],
+          "0.1 typed hides a cell stored as 0.10000000149")
+
+    # the GIF is rendered on this side, so it has to honour the scale too
+    fr = R.field_range(big, name, "")
+    glo = fr["vminpos"] or 1.0
+    if fr["vmax"] > glo:
+        gl = R.make_gif(big, name, "", glo, fr["vmax"], "viridis", max(1, big.nsteps // 3),
+                        5.0, log=True)
+        gn = R.make_gif(big, name, "", glo, fr["vmax"], "viridis", max(1, big.nsteps // 3),
+                        5.0, log=False)
+        check("a GIF renders in log space, and differently from a linear one",
+              gl[:6] in (b"GIF87a", b"GIF89a") and gl != gn,
+              f"{len(gl)/1024:.0f} kB log vs {len(gn)/1024:.0f} kB linear")
+    else:
+        print("  SKIP  no positive range in this field for the GIF check")
+
     print("\nhide-below threshold")
     # float32 stores 0.1 as 0.10000000149, so a typed 0.1 must still hide it
     f32 = float(np.float32(0.1))

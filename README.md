@@ -149,6 +149,20 @@ python3 rview_server.py /path/to/vti -p 8777          # then tunnel to it
 pure recolour of what is already downloaded, so it costs nothing and applies to
 the image, the colourbar and an exported GIF alike.
 
+**scale** switches the colour mapping between linear and logarithmic. This is
+not a recolour: the 8-bit codes themselves are respread, so switching refetches
+the series. That is the point — quantizing linearly and colouring
+logarithmically would leave the bottom decades sharing a handful of codes. Over
+a 0.1–1000 window, a linear encoding gives the whole 0.1–1 decade **one** code;
+a log encoding resolves it properly, and the readout, the `hide ≤` threshold and
+an exported GIF all follow the same mapping.
+
+A log window needs a positive floor. A field that reaches zero (`thk` on bare
+ground) or goes negative gets the smallest positive value in the series instead,
+and is told so; typing a floor at or below zero is refused. A field with nothing
+above zero at all is shown linearly, and says why. The colourbar grows decade
+ticks in log mode, so you can see where 1 and 100 actually sit.
+
 **axes** puts tick-labelled x and y around the image, in the file's own
 coordinates: `Origin` and `Spacing` read straight from the `.vti`, mapped with
 the same arithmetic the hover readout uses, so the value you read at a labelled

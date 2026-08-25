@@ -16,6 +16,7 @@ import argparse
 import base64
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -422,23 +423,28 @@ def field_range(coll: Collection, name: str, comp: str, max_frames: int = 0) -> 
         finite = a[np.isfinite(a)]
         if finite.size == 0:
             return None
+        pos = finite[finite > 0]
         return (float(finite.min()), float(finite.max()),
-                np.array(finite.ravel()[::RANGE_SAMPLE_STRIDE], dtype=np.float32))
+                np.array(finite.ravel()[::RANGE_SAMPLE_STRIDE], dtype=np.float32),
+                float(pos.min()) if pos.size else None)
 
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         res = [r for r in ex.map(one, idx) if r is not None]
     if not res:
-        info = {"vmin": 0.0, "vmax": 0.0, "p1": 0.0, "p99": 0.0,
+        info = {"vmin": 0.0, "vmax": 0.0, "p1": 0.0, "p99": 0.0, "vminpos": None,
                 "constant": True, "scanned": 0, "seconds": 0.0}
     else:
         vmin = min(r[0] for r in res)
         vmax = max(r[1] for r in res)
         pool = np.concatenate([r[2] for r in res])
         p1, p99 = (float(v) for v in np.percentile(pool, [1.0, 99.0]))
+        pos = [r[3] for r in res if r[3] is not None]
         info = {
             "vmin": vmin, "vmax": vmax,
             "p1": p1, "p99": p99,
+            # smallest value a log window could sit on, for fields that touch zero
+            "vminpos": min(pos) if pos else None,
             # A field that never varies (xi, p_bias, ... at early steps) must not
             # divide by zero downstream, and the UI says so instead of going black.
             "constant": bool(vmax <= vmin),
@@ -460,16 +466,42 @@ def decimate(a: np.ndarray, d: int) -> np.ndarray:
     return a[::d, ::d] if d > 1 else a
 
 
-def quantize(a: np.ndarray, lo: float, hi: float) -> np.ndarray:
-    """Map a 2D field to uint8 codes over [lo, hi], flipped so image row 0 is +y."""
+def use_log(lo: float, hi: float, log: bool) -> bool:
+    """Whether a log window is actually usable. The page applies the same test,
+    so both sides agree on what the codes mean without having to negotiate."""
+    return bool(log) and lo > 0 and hi > lo and np.isfinite(lo) and np.isfinite(hi)
+
+
+def quantize(a: np.ndarray, lo: float, hi: float, log: bool = False) -> np.ndarray:
+    """Map a 2D field to uint8 codes over [lo, hi], flipped so image row 0 is +y.
+
+    With log=True the 256 codes are spread evenly in log space, which is the
+    whole point: quantizing linearly and then colouring logarithmically would
+    leave the low decades sharing a handful of codes.
+    """
     if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
         codes = np.zeros(a.shape, dtype=np.uint8)
+    elif use_log(lo, hi, log):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x = ((np.log(a.astype(np.float32)) - math.log(lo))
+                 * (255.0 / (math.log(hi) - math.log(lo))) + 0.5)
+        # zero -> -inf, negative -> nan: both sit below the window, i.e. code 0
+        x = np.where(np.isfinite(x), x, 0.0)
+        codes = np.clip(x, 0, 255).astype(np.uint8)
     else:
         x = (a.astype(np.float32) - lo) * (255.0 / (hi - lo)) + 0.5
         x = np.where(np.isfinite(x), x, 0.0)
         codes = np.clip(x, 0, 255).astype(np.uint8)
     # VTK row 0 is y=0 (bottom); image row 0 is the top of the picture.
     return np.flipud(codes)
+
+
+def code_values(lo: float, hi: float, log: bool = False) -> np.ndarray:
+    """The value each of the 256 codes decodes to, the way the viewer decodes it."""
+    n = np.arange(256, dtype=np.float64) / 255.0
+    if use_log(lo, hi, log):
+        return np.exp(math.log(lo) + n * (math.log(hi) - math.log(lo)))
+    return lo + n * (hi - lo)
 
 
 MAX_DETAIL = 8
@@ -559,16 +591,18 @@ ENCODERS = {
 
 
 def encode_frame(coll: Collection, name: str, comp: str, t: int,
-                 lo: float, hi: float, fmt: str, d: int = 1) -> tuple[bytes, str]:
+                 lo: float, hi: float, fmt: str, d: int = 1,
+                 log: bool = False) -> tuple[bytes, str]:
     fmt = fmt if fmt in ENCODERS else "webp"
     d = max(1, int(d))
+    log = use_log(lo, hi, log)
     key = ((coll.name, name, comp, t) + file_id(coll.path(t))
-           + (round(lo, 6), round(hi, 6), fmt, d))
+           + (round(lo, 6), round(hi, 6), fmt, d, log))
     hit = _frame_cache.get(key)
     if hit is not None:
         return hit, ENCODERS[fmt][0]
 
-    codes = quantize(decimate(read_field(coll.path(t), name, comp), d), lo, hi)
+    codes = quantize(decimate(read_field(coll.path(t), name, comp), d), lo, hi, log)
     ctype, kw = ENCODERS[fmt]
     buf = io.BytesIO()
     Image.fromarray(codes, mode="L").save(buf, **kw)
@@ -583,11 +617,16 @@ TERRAIN_GREY = 150
 PAGE_BG = (11, 13, 18)
 
 
-def hidden_codes(lo: float, hi: float, maskval: float) -> np.ndarray:
-    """Which of the 256 codes the viewer's "hide <=" would blank, by the same rule."""
-    span = hi - lo
-    v = lo + np.arange(256, dtype=np.float64) * (span / 255.0 if span else 0.0)
-    return v <= maskval + abs(span) * 1e-6
+def hidden_codes(lo: float, hi: float, maskval: float, log: bool = False) -> np.ndarray:
+    """Which of the 256 codes the viewer's "hide <=" would blank, by the same rule.
+
+    The slack absorbs a threshold typed in decimal against a float32 stored value
+    (0.1 vs 0.10000000149). A linear window scales it by the window; a log one
+    scales it by the threshold, since near the floor the codes are much finer.
+    """
+    v = code_values(lo, hi, log)
+    tol = abs(maskval if use_log(lo, hi, log) else hi - lo) * 1e-6
+    return v <= maskval + tol
 
 
 def level_lut(cmap: str, levels: int) -> np.ndarray:
@@ -608,14 +647,15 @@ def make_gif(coll: Collection, name: str, comp: str, lo: float, hi: float,
              relief: str = "", az: float = 315.0, alt: float = 45.0,
              zf: float = 1.0, static: bool = False, intensity: float = 0.55,
              mask: bool = False, maskval: float = 0.0, opacity: float = 1.0,
-             d: int = 1, max_frames: int = 600) -> bytes:
+             d: int = 1, log: bool = False, max_frames: int = 600) -> bytes:
     """Animated GIF of the whole series, rendered here rather than in the browser."""
     idx = list(range(0, coll.nsteps, max(1, stride)))[:max_frames]
+    log = use_log(lo, hi, log)
     lut = level_lut(cmap, levels)
     if relief and opacity < 1.0:
         lut = np.clip(opacity * lut.astype(np.float32)
                       + (1.0 - opacity) * TERRAIN_GREY, 0, 255).astype(np.uint8)
-    hidden = hidden_codes(lo, hi, maskval) if mask else np.zeros(256, bool)
+    hidden = hidden_codes(lo, hi, maskval, log) if mask else np.zeros(256, bool)
 
     if not relief:
         # No relief: the colour table *is* the GIF palette, so the 8-bit codes
@@ -626,7 +666,7 @@ def make_gif(coll: Collection, name: str, comp: str, lo: float, hi: float,
 
         def one(i):
             im = Image.fromarray(
-                quantize(decimate(read_field(coll.path(i), name, comp), d), lo, hi), mode="P")
+                quantize(decimate(read_field(coll.path(i), name, comp), d), lo, hi, log), mode="P")
             im.putpalette(pal)
             return im
 
@@ -644,7 +684,7 @@ def make_gif(coll: Collection, name: str, comp: str, lo: float, hi: float,
             return shade_cache[key]
 
         def one(i):
-            codes = quantize(decimate(read_field(coll.path(i), name, comp), d), lo, hi)
+            codes = quantize(decimate(read_field(coll.path(i), name, comp), d), lo, hi, log)
             rgb = lut[codes].astype(np.float32)
             if mask:
                 # hidden cells show the bare shaded ground, as in the viewer
@@ -824,7 +864,8 @@ class Handler(BaseHTTPRequestHandler):
         hi = self._q(q, "hi", 1.0, float)
         fmt = self._q(q, "fmt", "webp")
         d = clamp_detail(self._q(q, "d", 1, int))
-        data, ctype = encode_frame(coll, field, comp, t, lo, hi, fmt, d)
+        log = self._q(q, "scale", "lin") == "log"
+        data, ctype = encode_frame(coll, field, comp, t, lo, hi, fmt, d, log)
         # The URL fully determines the bytes, so let the browser keep them forever.
         self._send(200, data, ctype, {
             "Cache-Control": "public, max-age=31536000, immutable",
@@ -890,6 +931,7 @@ class Handler(BaseHTTPRequestHandler):
             maskval=self._q(q, "maskval", 0.0, float),
             opacity=self._q(q, "opacity", 1.0, float),
             d=clamp_detail(self._q(q, "d", 1, int)),
+            log=self._q(q, "scale", "lin") == "log",
         )
         tag = f"{coll.name}_{field}{('_' + comp) if comp else ''}"
         self._send(200, data, "image/gif", {
@@ -961,7 +1003,7 @@ HTML_PAGE = r"""<!doctype html>
     background:rgba(12,14,20,.82);border:1px solid var(--edge);
     border-radius:6px;padding:8px;
   }
-  #cb{width:16px;height:190px;border:1px solid var(--edge);border-radius:3px;display:block}
+  #cb{display:block}
   .cblab{font:11px ui-monospace,Menlo,monospace;color:var(--dim)}
   #prog{
     position:relative;width:150px;height:6px;border-radius:3px;
@@ -1014,6 +1056,11 @@ HTML_PAGE = r"""<!doctype html>
   <label title="0 = smooth; N = N filled contour bands">levels</label>
   <input type="number" id="levels" min="0" max="64" step="1" value="0" style="width:56px"
          title="0 = smooth; N = N filled contour bands">
+  <label title="spread the colours over decades instead of evenly">scale</label>
+  <select id="scale" title="spread the colours over decades instead of evenly">
+    <option value="lin">linear</option>
+    <option value="log">log</option>
+  </select>
   <div class="sep"></div>
   <label title="tick-labelled x and y in the file's own coordinates">axes</label>
   <select id="axes" title="tick-labelled x and y in the file's own coordinates">
@@ -1093,7 +1140,7 @@ const S = {
   origin:[0,0], spacing:[1,1], times:[],
   t:0, cmap:"viridis", fmt:"webp", version:"",
   detail:"auto", d:1, fullNx:0, fullNy:0,
-  lo:0, hi:1, encLo:0, encHi:1, rmode:"robust", range:null,
+  lo:0, hi:1, encLo:0, encHi:1, encLog:false, rmode:"robust", range:null, scale:"lin",
   frames:new Map(), inflight:new Set(), failed:new Map(), gen:0,
   playing:false, fps:10, mask:false, maskVal:0,
   zoom:1, panx:0, pany:0, base:1, hover:null,
@@ -1134,6 +1181,34 @@ function note(msg){
 }
 
 function fieldKey(){ return S.field + "|" + S.comp; }
+
+// ------------------------------------------------------------- value scaling
+// A window maps values to 0..1 either evenly or by decades. Every place that
+// turns a value into a colour, or a code back into a value, goes through these,
+// so the encoded frame, the colourbar and the readout cannot drift apart.
+// Log is honoured only where it is meaningful; the server applies the same test
+// to the same lo/hi, so the two sides never disagree about what a code means.
+function canLog(lo, hi){ return lo > 0 && hi > lo && isFinite(lo) && isFinite(hi); }
+function logOK(){ return S.scale === "log" && canLog(S.lo, S.hi); }
+
+function normOf(v, lo, hi, log){
+  return log ? (Math.log(v) - Math.log(lo)) / (Math.log(hi) - Math.log(lo))
+             : (v - lo) / (hi - lo);
+}
+function valueOf(n, lo, hi, log){
+  return log ? Math.exp(Math.log(lo) + n * (Math.log(hi) - Math.log(lo)))
+             : lo + n * (hi - lo);
+}
+// what one of a frame's 256 codes is worth, in the window it was encoded against
+function codeValue(k, f){
+  return (f.hi > f.lo) ? valueOf(k / 255, f.lo, f.hi, !!f.log) : f.lo;
+}
+// slack for "hide <=" typed in decimal against a float32 cell (0.1 vs 0.1000000015).
+// Scaled by the window when linear; by the threshold when log, where the codes
+// near the floor are far finer. Mirrored by hidden_codes() for the GIF.
+function maskTol(){
+  return Math.abs(logOK() ? S.maskVal : S.hi - S.lo) * 1e-6;
+}
 
 // ---------------------------------------------------------------- startup
 async function boot(){
@@ -1361,7 +1436,27 @@ async function selectField(key){
   $("maskVal").value = String(r.vmin);
   note(r.constant ? ("'" + S.field + "' is constant at " + fmtNum(r.vmin) + " over every step")
                   : "");
+  if(logImpossible()){
+    note("'" + S.field + "' has no values above zero, so it is shown linearly");
+    S.scale = "lin"; $("scale").value = "lin";
+  }
   applyRangeMode();
+}
+
+// A log window needs a positive floor. A field that reaches zero (thk on bare
+// ground, a signed field's negatives) gets the smallest positive value in the
+// series instead of an impossible one, and is told so.
+function fixLogFloor(){
+  if(S.scale !== "log" || S.lo > 0) return false;
+  const r = S.range || {};
+  const from = [r.vminpos, S.hi * 1e-4].find(v => v > 0 && isFinite(v)) || 1e-6;
+  S.lo = Math.min(from, S.hi > 0 ? S.hi / 2 : from);
+  return true;
+}
+
+// Nothing positive at all, so there is nothing a log window could sit on.
+function logImpossible(){
+  return S.scale === "log" && !(S.range && S.range.vmax > 0);
 }
 
 function applyRangeMode(){
@@ -1369,8 +1464,12 @@ function applyRangeMode(){
   if(S.rmode === "global"){ S.lo = r.vmin; S.hi = r.vmax; }
   else if(S.rmode === "robust"){ S.lo = r.p1; S.hi = r.p99; }
   if(!(S.hi > S.lo)){ S.hi = S.lo + (Math.abs(S.lo) || 1) * 1e-6; }
+  if(fixLogFloor()){
+    note("log needs a positive minimum; using " + fmtNum(S.lo)
+         + ", the smallest above zero in this field");
+  }
   $("lo").value = trim(S.lo); $("hi").value = trim(S.hi);
-  S.encLo = S.lo; S.encHi = S.hi;
+  S.encLo = S.lo; S.encHi = S.hi; S.encLog = logOK();
   drawColorbar(); setT(S.t); startPrefetch();
 }
 
@@ -1379,6 +1478,7 @@ function frameURL(t){
   const qs = new URLSearchParams({
     coll:S.coll, field:S.field, comp:S.comp, t:String(t),
     lo:String(S.encLo), hi:String(S.encHi), fmt:S.fmt, v:S.version, d:String(S.d),
+    scale:(S.encLog ? "log" : "lin"),
   });
   return "/api/frame?" + qs;
 }
@@ -1407,7 +1507,7 @@ async function decodeLayer(res, what){
 
 async function fetchFrame(t){
   const code = await decodeLayer(await fetch(frameURL(t)), "frame " + t);
-  return {code, lo:S.encLo, hi:S.encHi, fmt:S.fmt};
+  return {code, lo:S.encLo, hi:S.encHi, fmt:S.fmt, log:S.encLog};
 }
 
 async function fetchShade(t){
@@ -1425,11 +1525,15 @@ async function fetchShade(t){
 function stale(f){
   if(!f) return true;
   if(f.fmt !== S.fmt) return true;
-  const ew = f.hi - f.lo;
+  if(!!f.log !== logOK()) return true;   // the codes are spaced the other way
+  // judge the window in the space the codes were spread over
+  const tr = v => f.log ? Math.log(v) : v;
+  const fl = tr(f.lo), fh = tr(f.hi), sl = tr(S.lo), sh = tr(S.hi);
+  const ew = fh - fl;
   if(!(ew > 0)) return S.hi > S.lo;
-  const eps = 1e-9 * (Math.abs(f.lo) + Math.abs(f.hi) + 1);
-  if(S.lo < f.lo - eps || S.hi > f.hi + eps) return true;
-  return (S.hi - S.lo) < 0.7 * ew;
+  const eps = 1e-9 * (Math.abs(fl) + Math.abs(fh) + 1);
+  if(!(sl >= fl - eps) || !(sh <= fh + eps)) return true;
+  return (sh - sl) < 0.7 * ew;
 }
 
 // Walks outward from the step being viewed, so whatever the user is looking at
@@ -1604,21 +1708,19 @@ function baseColor(cm, i, out, o){
 }
 
 function buildLUT(f){
-  const key = [f.lo, f.hi, S.lo, S.hi, S.cmap, S.mask?1:0, S.maskVal, S.levels,
-               drapeAlpha()].join("|");
+  const dlog = logOK();
+  const key = [f.lo, f.hi, f.log?1:0, S.lo, S.hi, dlog?1:0, S.cmap,
+               S.mask?1:0, S.maskVal, S.levels, drapeAlpha()].join("|");
   if(key === lutKey) return lutBuf;
   const cm = CM[S.cmap] || CM.viridis;
-  const span = (S.hi - S.lo) || 1;
-  const ew = f.hi - f.lo;
+  const tol = maskTol();
   for(let k=0;k<256;k++){
-    const v = ew > 0 ? f.lo + k * ew / 255 : f.lo;
-    const n = mapNorm(clamp((v - S.lo) / span, 0, 1));
+    const v = codeValue(k, f);
+    const n = mapNorm(clamp(normOf(v, S.lo, S.hi, dlog), 0, 1));
     const i = clamp(Math.round(n * 255), 0, 255) * 3;
     const o = k << 2;
     baseColor(cm, i, lutBuf, o);
-    // tolerant compare: typing the floor value (0.1) should hide cells stored as
-    // float32 0.10000000149, which is strictly greater
-    lutBuf[o+3] = (S.mask && v <= S.maskVal + Math.abs(span) * 1e-6) ? 0 : 255;
+    lutBuf[o+3] = (S.mask && v <= S.maskVal + tol) ? 0 : 255;
   }
   lutKey = key;
   return lutBuf;
@@ -1656,23 +1758,95 @@ function draw(){
   ctx.putImageData(imgData, 0, 0);
 }
 
-function drawColorbar(){
-  const cbc = $("cb").getContext("2d");
-  const cm = CM[S.cmap] || CM.viridis;
-  const h = $("cb").height, w = $("cb").width;
-  const im = cbc.createImageData(w, h);
-  for(let r=0;r<h;r++){
-    const i = clamp(Math.round(mapNorm(1 - r/(h-1)) * 255), 0, 255) * 3;
-    const px = [0,0,0];
-    baseColor(cm, i, px, 0);
-    for(let x=0;x<w;x++){
-      const o = (r*w + x) * 4;
-      im.data[o] = px[0]; im.data[o+1] = px[1]; im.data[o+2] = px[2]; im.data[o+3] = 255;
+const CB_H = 190, CB_W = 16;
+
+// Round numbers on a log bar: whole decades, subdivided when there are too few
+// and thinned when there are too many. Inside a single decade log is nearly
+// linear, so ordinary nice steps read better than 1-2-5.
+function cbTicks(){
+  const lo = S.lo, hi = S.hi;
+  const d0 = Math.floor(Math.log10(lo)), d1 = Math.ceil(Math.log10(hi));
+  const gen = ms => {
+    const out = [];
+    for(let d = d0; d <= d1; d++)
+      for(const m of ms){
+        const v = m * Math.pow(10, d);
+        if(v >= lo * (1 - 1e-9) && v <= hi * (1 + 1e-9)) out.push(v);
+      }
+    return out.sort((a, b) => a - b);
+  };
+  for(const ms of [[1], [1, 3], [1, 2, 5]]){
+    const t = gen(ms);
+    if(t.length >= 3 && t.length <= 9) return t;
+  }
+  let t = gen([1]);
+  if(t.length > 9){
+    for(const k of [2, 3, 5, 10]){
+      const thin = t.filter((_, i) => i % k === 0);
+      if(thin.length <= 9) return thin;
     }
   }
-  cbc.putImageData(im, 0, 0);
-  $("cblo").textContent = fmtNum(S.lo);
-  $("cbhi").textContent = fmtNum(S.hi);
+  if(t.length >= 2) return t;
+  return ticksIn(lo, hi, niceStep(hi - lo, 5));
+}
+
+// short enough for a 16px-wide bar's margin; fmtNum pads 0.1 out to 0.1000
+function cbLabel(v){
+  const a = Math.abs(v);
+  if(a === 0) return "0";
+  if(a < 1e-2 || a >= 1e5) return v.toExponential(0).replace("e+", "e");
+  return v.toFixed(Math.min(6, Math.max(0, -Math.floor(Math.log10(a)))));
+}
+
+function drawColorbar(){
+  const cb = $("cb"), cbc = cb.getContext("2d");
+  const cm = CM[S.cmap] || CM.viridis;
+  const lg = logOK(), dpr = window.devicePixelRatio || 1;
+
+  // a log bar carries its own ticks, so the two end labels come off
+  let ticks = [], labels = [], wmax = 0;
+  if(lg){
+    cbc.setTransform(1, 0, 0, 1, 0, 0);
+    cbc.font = AXFONT;
+    ticks = cbTicks();
+    labels = ticks.map(cbLabel);
+    for(const t of labels) wmax = Math.max(wmax, cbc.measureText(t).width);
+  }
+  $("cbhi").style.display = $("cblo").style.display = lg ? "none" : "";
+
+  const W = CB_W + 2 + (lg ? TICK + GAP + Math.ceil(wmax) : 0), H = CB_H;
+  cb.width = Math.round(W * dpr); cb.height = Math.round(H * dpr);
+  cb.style.width = W + "px"; cb.style.height = H + "px";
+  cbc.setTransform(dpr, 0, 0, dpr, 0, 0);
+  cbc.clearRect(0, 0, W, H);
+
+  const GH = H - 2;                       // the gradient, inside its border
+  for(let r = 0; r < GH; r++){
+    const i = clamp(Math.round(mapNorm(1 - r / (GH - 1)) * 255), 0, 255) * 3;
+    const px = [0, 0, 0];
+    baseColor(cm, i, px, 0);
+    cbc.fillStyle = "rgb(" + px[0] + "," + px[1] + "," + px[2] + ")";
+    cbc.fillRect(1, 1 + r, CB_W, 1);
+  }
+  cbc.strokeStyle = "#2b303b"; cbc.lineWidth = 1;
+  cbc.strokeRect(0.5, 0.5, CB_W + 1, H - 1);
+
+  if(lg){
+    const yOf = v => 1 + (1 - clamp(normOf(v, S.lo, S.hi, true), 0, 1)) * (GH - 1);
+    cbc.font = AXFONT;
+    cbc.fillStyle = "#9aa3b2"; cbc.strokeStyle = "#6b7486";
+    cbc.textAlign = "left"; cbc.textBaseline = "middle";
+    cbc.beginPath();
+    for(let i = 0; i < ticks.length; i++){
+      const y = Math.round(yOf(ticks[i])) + .5;
+      cbc.moveTo(CB_W + 1, y); cbc.lineTo(CB_W + 1 + TICK, y);
+      cbc.fillText(labels[i], CB_W + 1 + TICK + GAP, y);
+    }
+    cbc.stroke();
+  } else {
+    $("cblo").textContent = fmtNum(S.lo);
+    $("cbhi").textContent = fmtNum(S.hi);
+  }
 }
 
 function hud(){
@@ -1885,10 +2059,7 @@ function hoverAt(ev){
   if(!p){ S.hover = null; hud(); return; }
   const f = S.frames.get(S.t);
   let v = null;
-  if(f){
-    const code = f.code[p.row * S.nx + p.col];
-    v = (f.hi > f.lo) ? f.lo + code * (f.hi - f.lo) / 255 : f.lo;
-  }
+  if(f) v = codeValue(f.code[p.row * S.nx + p.col], f);
   // physical coords: image row 0 is the top, i.e. the largest y. One served
   // pixel spans d cells, so step by d to get back to model space.
   S.hover = {
@@ -1953,7 +2124,7 @@ function windowChanged(){
   clearTimeout(reTimer);
   reTimer = setTimeout(() => {
     // Re-encode at the new window; stale() decides which frames actually need it.
-    S.encLo = S.lo; S.encHi = S.hi;
+    S.encLo = S.lo; S.encHi = S.hi; S.encLog = logOK();
     startPrefetch(); updateProgress();
   }, 450);
 }
@@ -1971,11 +2142,39 @@ function wire(){
   for(const id of ["lo","hi"]){
     $(id).addEventListener("change", () => {
       const lo = parseFloat($("lo").value), hi = parseFloat($("hi").value);
-      if(!isFinite(lo) || !isFinite(hi) || hi <= lo) return;
+      if(!isFinite(lo) || !isFinite(hi) || hi <= lo){ $(id).value = trim(S[id]); return; }
+      if(S.scale === "log" && lo <= 0){
+        note("a log scale needs a minimum above zero");
+        $("lo").value = trim(S.lo);
+        return;
+      }
       S.lo = lo; S.hi = hi; S.rmode = "manual"; $("rmode").value = "manual";
+      note("");
       windowChanged();
     });
   }
+
+  $("scale").addEventListener("change", e => {
+    S.scale = e.target.value;
+    if(logImpossible()){
+      note("'" + S.field + "' has no values above zero, so a log scale has nothing to sit on");
+      S.scale = "lin"; e.target.value = "lin";
+      return;
+    }
+    note("");
+    // Re-derive rather than patch, so the window still follows the range mode
+    // and a later field change picks its own window up again.
+    if(S.rmode !== "manual"){ applyRangeMode(); updateProgress(); return; }
+    if(fixLogFloor()){
+      note("log needs a positive minimum; using " + fmtNum(S.lo)
+           + ", the smallest above zero in this field");
+      $("lo").value = trim(S.lo);
+    }
+    // the codes themselves are spaced differently now, so this is a refetch
+    S.encLo = S.lo; S.encHi = S.hi; S.encLog = logOK();
+    lutKey = ""; drawColorbar(); draw();
+    startPrefetch(); updateProgress();
+  });
   // banding is a pure recolour: no refetch, the cached codes are unchanged
   $("levels").addEventListener("change", e => {
     S.levels = clamp(parseInt(e.target.value, 10) || 0, 0, 64);
@@ -2104,6 +2303,7 @@ function wire(){
       static:(S.rstatic ? "1" : "0"), intensity:String(S.intensity),
       mask:(S.mask ? "1" : "0"), maskval:String(S.maskVal),
       opacity:String(S.opacity), d:String(S.d),
+      scale:(logOK() ? "log" : "lin"),
     });
     window.location.href = "/api/gif?" + qs;
   };
