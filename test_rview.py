@@ -200,6 +200,61 @@ def main():
     check("a collection version is stable while nothing changes",
           v1 == big.version(ttl=0.0), v1)
 
+    print("\ngrowing collection")
+    import tempfile, shutil
+    with tempfile.TemporaryDirectory() as tmp:
+        # Stand-in for a run in progress: real .vti files, a .pvd we can extend.
+        nsim = min(4, big.nsteps)
+        listed = []
+        for i in range(nsim):
+            dst = "step_%04d.vti" % i
+            shutil.copy(big.path(i), os.path.join(tmp, dst))
+            listed.append((float(i), dst))
+
+        def write_pvd(k, name="run"):
+            rows = "\n".join('    <DataSet timestep="%g" file="%s"/>' % e
+                             for e in listed[:k])
+            with open(os.path.join(tmp, name + ".pvd"), "w") as fh:
+                fh.write('<?xml version="1.0"?>\n<VTKFile type="Collection" version="0.1">\n'
+                         '  <Collection>\n%s\n  </Collection>\n</VTKFile>\n' % rows)
+
+        def cmeta(name="run"):
+            return next(c for c in st.meta()["collections"] if c["name"] == name)
+
+        write_pvd(2)
+        st = R.Store(tmp)
+        check("a fresh store sees the steps it was given", cmeta()["nsteps"] == 2)
+        head0 = cmeta()["head"]
+
+        write_pvd(nsim)
+        check("appended steps appear without restarting the server",
+              cmeta()["nsteps"] == nsim, f"2 -> {cmeta()['nsteps']}")
+        check("appending leaves the head alone, so a viewer keeps its cache",
+              cmeta()["head"] == head0)
+
+        # the .pvd names a step whose file the run has not finished writing
+        listed.append((float(nsim), "step_%04d.vti" % nsim))
+        write_pvd(nsim + 1)
+        check("a step listed before its file exists is skipped, not fatal",
+              cmeta()["nsteps"] == nsim, f"{nsim + 1} listed, {cmeta()['nsteps']} usable")
+        shutil.copy(big.path(0), os.path.join(tmp, listed[-1][1]))
+        check("and appears once the file lands, though the .pvd never changed",
+              cmeta()["nsteps"] == nsim + 1)
+
+        # a rerun rewrites step 0: the viewer must be told to drop what it holds
+        step0 = os.path.join(tmp, listed[0][1])
+        bump = R.file_id(step0)[0] + 10**9
+        os.utime(step0, ns=(bump, bump))
+        check("a rerun changes the head, so a viewer knows to reload",
+              cmeta()["head"] != head0)
+
+        write_pvd(2, name="second")
+        names = [c["name"] for c in st.meta()["collections"]]
+        check("a .pvd added after startup is discovered", "second" in names, ", ".join(names))
+        os.remove(os.path.join(tmp, "second.pvd"))
+        check("and a removed one stops being listed",
+              "second" not in [c["name"] for c in st.meta()["collections"]])
+
     print("\ndecimation")
     a = R.read_field(big.path(0), name, "")
     for d in (2, 3, 4):
@@ -210,6 +265,24 @@ def main():
         # striding, not averaging: every sent value must be a real cell value
         check(f"d={d} sends exact cell values, so thresholds stay meaningful",
               np.array_equal(dec, a[::d, ::d]))
+    # The axes overlay labels served row r with y = origin + (ny-1-r)*spacing*d,
+    # and served column c with x = origin + c*spacing*d. That is only right if
+    # decimating and then flipping leaves row 0 showing the largest y, so check
+    # the combination rather than either half.
+    ny, nx = a.shape
+    ramp = np.tile(np.arange(ny, dtype=np.float32)[:, None], (1, nx))
+    for d in (1, 2, 3, 4):
+        q = R.quantize(R.decimate(ramp, d), 0.0, float(ny - 1))
+        nyd = -(-ny // d)
+        want = (nyd - 1) * d                       # the model row the top shows
+        got = q[0, 0] / 255.0 * (ny - 1)
+        check(f"d={d}: image row 0 is the model row the axes label it with",
+              abs(got - want) <= (ny - 1) / 255 / 2 + 1e-6,
+              f"row 0 shows model row {got:.1f}, axes say {want}")
+        check(f"d={d}: image row {nyd-1} is the model row the axes label it with",
+              abs(q[nyd - 1, 0] / 255.0 * (ny - 1)) <= (ny - 1) / 255 / 2 + 1e-6,
+              "the bottom of the image is y = origin")
+
     for d in (1, 2, 3):
         data, _ = R.encode_frame(big, name, "", 0, float(a.min()), float(a.max()) or 1.0, "webp", d)
         im = Image.open(io.BytesIO(data))

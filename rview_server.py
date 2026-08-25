@@ -296,15 +296,35 @@ class Collection:
         if not entries:
             raise ValueError(f"{pvd_path}: no <DataSet> entries")
         entries.sort(key=lambda e: e[0])
+        # A running simulation writes the .pvd entry before (or while) the .vti
+        # lands, so the tail can name files that are not there yet. Drop those
+        # instead of letting one unfinished step sink the whole collection.
+        listed = len(entries)
+        while len(entries) > 1 and not os.path.exists(entries[-1][1]):
+            entries.pop()
+        # If we dropped a tail, the .pvd will not change again when those files
+        # finally appear, so refresh() has to re-check rather than trust mtime.
+        self._pending = len(entries) < listed
         self.times = [e[0] for e in entries]
         self.files = [e[1] for e in entries]
-        missing = [f for f in self.files[:1] if not os.path.exists(f)]
-        if missing:
-            raise ValueError(f"{pvd_path}: referenced file not found: {missing[0]}")
+        if not os.path.exists(self.files[0]):
+            raise ValueError(f"{pvd_path}: referenced file not found: {self.files[0]}")
         self._pvd_id = file_id(pvd_path)
+        self._checked = time.time()
         self._ver = None
         self._ver_at = 0.0
         header_for(self.files[0])   # fail fast on an unreadable first file
+
+    @property
+    def head(self) -> str:
+        """Identity of step 0 alone, restatted on every call.
+
+        Unchanged head plus unchanged leading timestep values means the steps a
+        viewer already holds are still the same data, so a refresh that only
+        appended steps can keep its cache. A rerun rewrites step 0 and this
+        changes, even when the .pvd itself does not.
+        """
+        return "%x-%x" % file_id(self.files[0])
 
     @property
     def header(self) -> VtiHeader:
@@ -312,10 +332,16 @@ class Collection:
         # (a remount, a rerun) and the geometry with them.
         return header_for(self.files[0])
 
-    def refresh(self) -> None:
-        """Re-read the .pvd if it changed, so added or removed steps are picked up."""
-        now = file_id(self.pvd_path)
-        if now != self._pvd_id:
+    def refresh(self, force: bool = False) -> None:
+        """Re-read the .pvd if it changed, so added or removed steps are picked up.
+
+        A tail we dropped as unwritten needs re-checking even when the .pvd is
+        untouched, but not on every frame request: force it when the listing is
+        what was asked for, and rate-limit it otherwise.
+        """
+        if file_id(self.pvd_path) != self._pvd_id:
+            self.__init__(self.name, self.pvd_path)
+        elif self._pending and (force or time.time() - self._checked >= 1.0):
             self.__init__(self.name, self.pvd_path)
 
     def version(self, ttl: float = 2.0) -> str:
@@ -356,6 +382,7 @@ class Collection:
         return {
             "name": self.name,
             "version": self.version(),
+            "head": self.head,
             "nsteps": self.nsteps,
             "times": self.times,
             "fields": self.fields_meta(),
@@ -650,18 +677,45 @@ class Store:
         self.range_frames = range_frames
         self.colls: dict[str, Collection] = {}
         self.errors: list[str] = []
-        pvds = sorted(f for f in os.listdir(self.dir) if f.lower().endswith(".pvd"))
-        if not pvds:
+        self.rescan(strict=True)
+
+    def rescan(self, strict: bool = False) -> None:
+        """Re-list the directory so collections written since startup appear.
+
+        A run in progress can drop in a whole new .pvd, not just extra steps in
+        an existing one, so refreshing has to look at the directory again and
+        not only at the collections already loaded.
+        """
+        try:
+            pvds = sorted(f for f in os.listdir(self.dir) if f.lower().endswith(".pvd"))
+        except OSError as exc:
+            if strict:
+                raise SystemExit(f"cannot read {self.dir}: {exc}")
+            self.errors = [f"{self.dir}: {exc}"]
+            return
+        if strict and not pvds:
             raise SystemExit(f"no .pvd files in {self.dir}")
+        keep, errors = {}, []
         for f in pvds:
             nm = os.path.splitext(f)[0]
+            path = os.path.join(self.dir, f)
+            have = self.colls.get(nm)
+            if have is not None and have.pvd_path == path:
+                keep[nm] = have          # kept as-is; refresh() re-reads it
+                continue
             try:
-                self.colls[nm] = Collection(nm, os.path.join(self.dir, f))
+                keep[nm] = Collection(nm, path)
             except Exception as exc:  # a broken collection must not sink the rest
-                self.errors.append(f"{f}: {exc}")
+                errors.append(f"{f}: {exc}")
                 sys.stderr.write(f"[rview] skipping {f}: {exc}\n")
-        if not self.colls:
-            raise SystemExit(f"no readable collections in {self.dir}")
+        if not keep:
+            if strict:
+                raise SystemExit(f"no readable collections in {self.dir}")
+            # Transient: a remount in progress, say. Keep serving what we have.
+            self.errors = errors or [f"no readable collections in {self.dir}"]
+            return
+        self.colls = keep
+        self.errors = errors
 
     def get(self, name: str) -> Collection:
         if name not in self.colls:
@@ -671,8 +725,9 @@ class Store:
         return c
 
     def meta(self) -> dict:
+        self.rescan()
         for c in self.colls.values():
-            c.refresh()
+            c.refresh(force=True)
         return {
             "dir": self.dir,
             "build": BUILD,
@@ -887,6 +942,7 @@ HTML_PAGE = r"""<!doctype html>
     image-rendering:pixelated;transform-origin:0 0;position:absolute;left:0;top:0;
     cursor:crosshair;transition:opacity .12s;
   }
+  #ax{position:absolute;left:0;top:0;pointer-events:none}
   #hud{
     position:absolute;left:10px;top:10px;padding:6px 9px;border-radius:6px;
     background:rgba(12,14,20,.82);border:1px solid var(--edge);
@@ -921,6 +977,7 @@ HTML_PAGE = r"""<!doctype html>
 
 <div class="bar">
   <label>set</label><select id="coll"></select>
+  <button id="refresh" title="re-read the .pvd listing (r): picks up timesteps written since this page loaded">&#8635;</button>
   <label>field</label><select id="field"></select>
   <div class="sep"></div>
   <label>range</label><select id="rmode">
@@ -958,6 +1015,13 @@ HTML_PAGE = r"""<!doctype html>
   <input type="number" id="levels" min="0" max="64" step="1" value="0" style="width:56px"
          title="0 = smooth; N = N filled contour bands">
   <div class="sep"></div>
+  <label title="tick-labelled x and y in the file's own coordinates">axes</label>
+  <select id="axes" title="tick-labelled x and y in the file's own coordinates">
+    <option value="ticks">on</option>
+    <option value="grid">on + grid</option>
+    <option value="off">off</option>
+  </select>
+  <div class="sep"></div>
   <label>relief</label><select id="relief"></select>
   <span id="reliefopts" style="display:none;align-items:center;gap:10px">
     <label title="shade every step with step 0's relief: one image for the whole series
@@ -983,6 +1047,7 @@ instead of one per step"><input type="checkbox" id="rstatic"> static</label>
 
 <div id="stage">
   <canvas id="cv"></canvas>
+  <canvas id="ax"></canvas>
   <div id="hud"></div>
   <div id="note"></div>
   <div id="cbwrap">
@@ -1033,7 +1098,9 @@ const S = {
   playing:false, fps:10, mask:false, maskVal:0,
   zoom:1, panx:0, pany:0, base:1, hover:null,
   levels:0,
+  axes:"ticks",
   relief:"off", rstatic:false, az:315, alt:45, zf:1, intensity:0.55, opacity:1,
+  refnote:"",
   shades:new Map(),
 };
 
@@ -1084,12 +1151,7 @@ async function boot(){
   }
   cmapSel.value = S.cmap;
 
-  const cs = $("coll");
-  for(const c of meta.collections){
-    const o = document.createElement("option");
-    o.value = c.name; o.textContent = c.name + "  (" + c.nsteps + ")";
-    cs.appendChild(o);
-  }
+  const cs = fillCollections();
   if(meta.errors && meta.errors.length) console.warn("collection errors", meta.errors);
 
   const want = new URLSearchParams(location.search).get("coll");
@@ -1099,6 +1161,107 @@ async function boot(){
 }
 
 function collMeta(){ return S.meta.collections.find(c=>c.name===S.coll); }
+
+// The step count lives in the option label, so this is also how a refresh shows
+// that a set has grown without anything being selected.
+function fillCollections(){
+  const cs = $("coll");
+  cs.innerHTML = "";
+  for(const c of S.meta.collections){
+    const o = document.createElement("option");
+    o.value = c.name; o.textContent = c.name + "  (" + c.nsteps + ")";
+    cs.appendChild(o);
+  }
+  return cs;
+}
+
+// ------------------------------------------------------ refreshing the listing
+// A run in progress keeps appending steps. Re-reading /api/meta picks them up;
+// the work here is deciding whether the frames already downloaded are still the
+// same data, because dropping a 500-frame cache on every refresh would defeat
+// the point of watching a run.
+function refstat(msg){ S.refnote = msg || ""; updateStatus(); }
+
+function sameFields(a, b){
+  return a.length === b.length &&
+         a.every((f,i) => f.name === b[i].name && f.ncomp === b[i].ncomp);
+}
+
+// Same step 0, same geometry, same fields, and the old timestep values still a
+// prefix of the new ones: the steps we hold are untouched, only later ones added.
+function appendedOnly(was, now){
+  return !!was && now.head === was.head && now.nx === was.nx && now.ny === was.ny
+      && now.nsteps >= was.nsteps && sameFields(was.fields, now.fields)
+      && was.times.every((t,i) => t === now.times[i]);
+}
+
+// Rescan the value range. Adopting a new window re-encodes every frame, so say
+// whether the new range actually needs more room than the current window.
+async function rangeGrew(){
+  const qs = new URLSearchParams({coll:S.coll, field:S.field, comp:S.comp});
+  let r;
+  try{ r = await (await fetch("/api/range?" + qs)).json(); }
+  catch(e){ return false; }
+  if(!r || r.error) return false;
+  S.range = r;
+  const lo = S.rmode === "global" ? r.vmin : r.p1;
+  const hi = S.rmode === "global" ? r.vmax : r.p99;
+  const tol = 0.01 * Math.max(S.hi - S.lo, Math.abs(S.hi) * 1e-9);
+  return lo < S.lo - tol || hi > S.hi + tol;
+}
+
+async function refreshListing(){
+  const btn = $("refresh");
+  if(btn.disabled) return;              // one at a time; meta can take a moment
+  btn.disabled = true;
+  refstat("checking ...");
+  try{
+    const meta = await (await fetch("/api/meta", {cache:"no-store"})).json();
+    const was = collMeta();
+    S.meta = meta;
+    if(meta.errors && meta.errors.length) console.warn("collection errors", meta.errors);
+    const cs = fillCollections();
+
+    if(!meta.collections.some(c => c.name === S.coll)){
+      const gone = S.coll;
+      cs.value = meta.collections[0].name;
+      await selectCollection(cs.value);   // clears the note, so say it after
+      refstat("'" + gone + "' is gone");
+      return;
+    }
+    cs.value = S.coll;
+    const now = collMeta();
+
+    if(!appendedOnly(was, now)){
+      // geometry, fields or the history itself changed: nothing cached survives
+      await selectCollection(S.coll);
+      refstat("dataset changed - reloaded (" + S.nsteps + ")");
+      return;
+    }
+
+    const added = now.nsteps - was.nsteps;
+    const wasAtEnd = S.t === was.nsteps - 1;
+    if(added && was.nsteps){
+      // whatever was last may have been caught half-written
+      S.frames.delete(was.nsteps - 1);
+      S.shades.delete(was.nsteps - 1);
+    }
+    S.version = now.version || "";
+    S.nsteps = now.nsteps; S.times = now.times;
+    $("tslider").max = String(S.nsteps - 1);
+    refstat(added ? ("+" + added + " step" + (added > 1 ? "s" : "") + "  (" + S.nsteps + ")")
+                  : ("no new steps (" + S.nsteps + ")"));
+
+    if(added && S.rmode !== "manual" && await rangeGrew()) applyRangeMode();
+    updateStatus();
+    setT(wasAtEnd ? S.nsteps - 1 : S.t);   // parked on the end means follow the end
+    startPrefetch(); updateProgress();
+  }catch(e){
+    refstat("refresh failed: " + e);
+  }finally{
+    btn.disabled = false;
+  }
+}
 
 // Pick a decimation that lands the served grid near the size it will actually be
 // drawn at. At "fit" a 1856x1344 grid shows at about 965x700 on a normal window,
@@ -1129,6 +1292,7 @@ function detailNote(){ updateStatus(); }
 
 async function selectCollection(name){
   S.coll = name;
+  S.refnote = "";        // whatever the last refresh said was about another set
   const c = collMeta();
   S.fullNx = c.nx; S.fullNy = c.ny; S.nsteps = c.nsteps; S.version = c.version || "";
   S.origin = c.origin; S.spacing = c.spacing; S.times = c.times;
@@ -1365,6 +1529,7 @@ function updateStatus(){
     bits.push(S.rstatic ? "relief: 1 image for the series"
                         : "relief: 1 image per step (" + S.nsteps + ")");
   }
+  if(S.refnote) bits.push(S.refnote);
   el.textContent = bits.join("   \u00b7   ");
 }
 
@@ -1528,19 +1693,183 @@ function hud(){
   $("hud").innerHTML = lines.join("\n");
 }
 
+// ------------------------------------------------------------------ axes
+// Drawn on an overlay canvas in screen pixels rather than on the image itself:
+// the data canvas is CSS-scaled by the zoom, and text and hairlines scaled with
+// it would be unreadable. The overlay also masks whatever the image has been
+// panned into the margins, so the labels always sit on background.
+const axc = $("ax").getContext("2d");
+const AXFONT = "11px ui-monospace,SFMono-Regular,Menlo,monospace";
+const STAGE_BG = "#0b0d12";     // matches #stage
+const TICK = 5, GAP = 4, LINEH = 12;
+
+// Served grid <-> the file's own coordinates. Deliberately the same arithmetic
+// as hoverAt(), so the value you read at a labelled coordinate is that one.
+function physX(col){ return S.origin[0] + col * S.spacing[0] * S.d; }
+function physY(row){ return S.origin[1] + (S.ny - 1 - row) * S.spacing[1] * S.d; }
+function colOf(x){ return (x - S.origin[0]) / (S.spacing[0] * S.d); }
+function rowOf(y){ return S.ny - 1 - (y - S.origin[1]) / (S.spacing[1] * S.d); }
+
+function niceStep(span, want){
+  const raw = Math.abs(span) / Math.max(1, want);
+  if(!(raw > 0)) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw))), n = raw / mag;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * mag;
+}
+
+// The .vti says nothing about units, so labels never claim any. Long coordinates
+// get a shared power of ten instead, quoted once on the axis.
+function axisScale(lo, hi){
+  const m = Math.max(Math.abs(lo), Math.abs(hi));
+  return m >= 1e5 ? Math.pow(10, 3 * Math.floor(Math.log10(m) / 3)) : 1;
+}
+
+function tickText(v, step, k){
+  const dec = clamp(Math.ceil(-Math.log10(step / k)), 0, 6);
+  const s = (v / k).toFixed(dec);
+  return s === "-0" ? "0" : s;
+}
+
+function expLabel(k){
+  if(k === 1) return "";
+  const sup = "⁰¹²³⁴⁵⁶⁷⁸⁹";
+  return "  ×10" + String(Math.round(Math.log10(k))).replace(/\d/g, d => sup[+d]);
+}
+
+// Margins are sized from the whole grid, not the visible part, so they do not
+// twitch while panning.
+function axisGutter(){
+  if(S.axes === "off" || !S.nx) return {l:0, r:0, t:0, b:0};
+  axc.font = AXFONT;
+  const lo = physY(S.ny - 1), hi = physY(0);
+  const k = axisScale(lo, hi), step = niceStep(hi - lo, 6);
+  const w = Math.max(axc.measureText(tickText(lo, step, k)).width,
+                     axc.measureText(tickText(hi, step, k)).width);
+  return {l: Math.ceil(w) + TICK + GAP * 2 + LINEH, r: 12,
+          t: 10, b: TICK + GAP * 2 + LINEH * 2};
+}
+
+function ticksIn(lo, hi, step){
+  const out = [];
+  const eps = step * 1e-6;
+  for(let i = Math.ceil(lo / step - 1e-9); i * step <= hi + eps; i++) out.push(i * step);
+  return out;
+}
+
+function drawAxes(){
+  const st = $("stage"), ax = $("ax");
+  const W = st.clientWidth, H = st.clientHeight, dpr = window.devicePixelRatio || 1;
+  if(ax.width !== Math.round(W * dpr) || ax.height !== Math.round(H * dpr)){
+    ax.width = Math.round(W * dpr); ax.height = Math.round(H * dpr);
+    ax.style.width = W + "px"; ax.style.height = H + "px";
+  }
+  axc.setTransform(dpr, 0, 0, dpr, 0, 0);
+  axc.clearRect(0, 0, W, H);
+  if(S.axes === "off" || !S.nx) return;
+
+  const g = axisGutter();
+  const x0 = g.l, x1 = W - g.r, y0 = g.t, y1 = H - g.b;
+  if(x1 - x0 < 40 || y1 - y0 < 40) return;
+
+  // mask the margins: the image is free to be panned under them
+  axc.fillStyle = STAGE_BG;
+  axc.fillRect(0, 0, W, y0); axc.fillRect(0, y1, W, H - y1);
+  axc.fillRect(0, y0, x0, y1 - y0); axc.fillRect(x1, y0, W - x1, y1 - y0);
+
+  const s = S.base * S.zoom;
+  // a cell's coordinate belongs to its centre, half a pixel in from its edge
+  const sxOf = x => S.panx + (colOf(x) + 0.5) * s;
+  const syOf = y => S.pany + (rowOf(y) + 0.5) * s;
+  const xOf = sx => physX((sx - S.panx) / s - 0.5);
+  const yOf = sy => physY((sy - S.pany) / s - 0.5);
+
+  const dx = [physX(0), physX(S.nx - 1)].sort((a, b) => a - b);
+  const dy = [physY(0), physY(S.ny - 1)].sort((a, b) => a - b);
+  const vx = [Math.max(Math.min(xOf(x0), xOf(x1)), dx[0]),
+              Math.min(Math.max(xOf(x0), xOf(x1)), dx[1])];
+  const vy = [Math.max(Math.min(yOf(y0), yOf(y1)), dy[0]),
+              Math.min(Math.max(yOf(y0), yOf(y1)), dy[1])];
+
+  // The data's own rectangle. Ticks hang off it rather than off the window, so
+  // the axes stay against the image; if a zoom pushes an edge out of view the
+  // baseline clamps to the plot area and the labels fall into the margin.
+  const dl = sxOf(dx[0]) - s / 2, dr = sxOf(dx[1]) + s / 2;
+  const dt = syOf(dy[1]) - s / 2, db = syOf(dy[0]) + s / 2;
+  const fl = clamp(dl, x0, x1), fr = clamp(dr, x0, x1);
+  const ft = clamp(dt, y0, y1), fb = clamp(db, y0, y1);
+
+  const showX = vx[1] > vx[0] && fr > fl, showY = vy[1] > vy[0] && fb > ft;
+  const stepX = niceStep(vx[1] - vx[0], Math.max(2, Math.round((fr - fl) / 110)));
+  const stepY = niceStep(vy[1] - vy[0], Math.max(2, Math.round((fb - ft) / 70)));
+  const kX = axisScale(vx[0], vx[1]), kY = axisScale(vy[0], vy[1]);
+  const tx = showX ? ticksIn(vx[0], vx[1], stepX) : [];
+  const ty = showY ? ticksIn(vy[0], vy[1], stepY) : [];
+
+  if(S.axes === "grid"){
+    axc.strokeStyle = "rgba(230,233,239,.10)";
+    axc.lineWidth = 1;
+    axc.beginPath();
+    for(const v of tx){ const X = Math.round(sxOf(v)) + .5; axc.moveTo(X, ft); axc.lineTo(X, fb); }
+    for(const v of ty){ const Y = Math.round(syOf(v)) + .5; axc.moveTo(fl, Y); axc.lineTo(fr, Y); }
+    axc.stroke();
+  }
+
+  axc.strokeStyle = "#4b5364";
+  axc.lineWidth = 1;
+  axc.strokeRect(Math.round(fl) + .5, Math.round(ft) + .5,
+                 Math.max(0, Math.round(fr - fl)), Math.max(0, Math.round(fb - ft)));
+
+  axc.font = AXFONT;
+  axc.fillStyle = "#9aa3b2";
+  axc.strokeStyle = "#6b7486";
+  axc.beginPath();
+  axc.textAlign = "center"; axc.textBaseline = "top";
+  for(const v of tx){
+    const X = Math.round(sxOf(v)) + .5;
+    axc.moveTo(X, fb + .5); axc.lineTo(X, fb + TICK);
+    axc.fillText(tickText(v, stepX, kX), X, fb + TICK + GAP);
+  }
+  let wmax = 0;
+  axc.textAlign = "right"; axc.textBaseline = "middle";
+  for(const v of ty){
+    const Y = Math.round(syOf(v)) + .5, txt = tickText(v, stepY, kY);
+    wmax = Math.max(wmax, axc.measureText(txt).width);
+    axc.moveTo(fl + .5, Y); axc.lineTo(fl - TICK, Y);
+    axc.fillText(txt, fl - TICK - GAP, Y);
+  }
+  axc.stroke();
+
+  axc.fillStyle = "#c3cad6";
+  if(showX){
+    axc.textAlign = "center"; axc.textBaseline = "top";
+    axc.fillText("x" + expLabel(kX), (fl + fr) / 2, fb + TICK + GAP + LINEH);
+  }
+  if(showY){
+    axc.save();
+    axc.translate(Math.max(GAP + 1, fl - TICK - GAP * 2 - wmax - LINEH), (ft + fb) / 2);
+    axc.rotate(-Math.PI / 2);
+    axc.textAlign = "center"; axc.textBaseline = "top";
+    axc.fillText("y" + expLabel(kY), 0, 0);
+    axc.restore();
+  }
+}
+
 // -------------------------------------------------------------- view / zoom
 function fitView(){
-  const st = $("stage");
-  S.base = Math.min(st.clientWidth / S.nx, (st.clientHeight - 4) / S.ny) * 0.94;
+  const st = $("stage"), g = axisGutter();
+  const w = Math.max(20, st.clientWidth - g.l - g.r);
+  const h = Math.max(20, st.clientHeight - g.t - g.b - 4);
+  S.base = Math.min(w / S.nx, h / S.ny) * 0.94;
   S.zoom = 1;
-  S.panx = (st.clientWidth - S.nx * S.base) / 2;
-  S.pany = (st.clientHeight - S.ny * S.base) / 2;
+  S.panx = g.l + (w - S.nx * S.base) / 2;
+  S.pany = g.t + (h - S.ny * S.base) / 2;
   applyView();
 }
 
 function applyView(){
   const s = S.base * S.zoom;
   cv.style.transform = "translate(" + S.panx + "px," + S.pany + "px) scale(" + s + ")";
+  drawAxes();
 }
 
 function pixelAt(ev){
@@ -1654,6 +1983,10 @@ function wire(){
     lutKey = ""; drawColorbar(); draw();
   });
 
+  $("axes").addEventListener("change", e => {
+    S.axes = e.target.value;
+    fitView();          // the margins changed, so the image has to be re-placed
+  });
   $("relief").addEventListener("change", e => {
     S.relief = e.target.value;
     $("reliefopts").style.display = S.relief === "off" ? "none" : "inline-flex";
@@ -1704,6 +2037,7 @@ function wire(){
   $("play").onclick  = () => setPlaying(!S.playing);
   $("fps").addEventListener("change", e => { S.fps = clamp(parseFloat(e.target.value)||10, 1, 60); });
   $("reset").onclick = () => fitView();
+  $("refresh").onclick = () => refreshListing();
 
   window.addEventListener("keydown", e => {
     if(/^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
@@ -1713,6 +2047,7 @@ function wire(){
     else if(e.key === "Home"){ setT(0); e.preventDefault(); }
     else if(e.key === "End"){ setT(S.nsteps - 1); e.preventDefault(); }
     else if(e.key === " "){ setPlaying(!S.playing); e.preventDefault(); }
+    else if(e.key === "r" || e.key === "R"){ refreshListing(); e.preventDefault(); }
   });
 
   // pan / zoom

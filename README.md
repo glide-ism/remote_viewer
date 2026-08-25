@@ -58,9 +58,37 @@ adding steps all change it, and the server picks that up without a restart —
 its own caches are keyed on each file's identity rather than its path, and a
 `.pvd` is re-read when it changes.
 
-Reload the page after swapping the data; nothing else is needed. As a backstop,
-a decoded layer whose size does not match the current grid is rejected outright
-rather than drawn, so a stale image can never end up tiled into a corner.
+Reload the page after swapping the data, or press **&#8635;** — see below.
+As a backstop, a decoded layer whose size does not match the current grid is
+rejected outright rather than drawn, so a stale image can never end up tiled
+into a corner.
+
+## Watching a run in progress
+
+The **&#8635;** button beside the set selector (or `r`) re-reads the `.pvd`
+listing, so steps written since the page loaded appear without a reload. It also
+notices a whole new `.pvd` dropped into the directory, and a set that has gone
+away.
+
+What it avoids is throwing away the cache. If step 0 and the existing timestep
+values are unchanged and only later steps were added, the frames already
+downloaded are kept and only the new ones are fetched, and the status line on the
+right reads `+7 steps  (507)`. If step 0 changed — a rerun over the same filenames — or
+the geometry or field list changed, that cannot be true, and the collection is
+reloaded from scratch instead.
+
+Two details make this workable on a directory being written into:
+
+- A `.pvd` entry whose `.vti` has not landed yet is dropped rather than failing
+  the whole collection, and is picked up on a later refresh even though the
+  `.pvd` itself never changes again.
+- Refreshing rescans the value range, but adopting a new window re-encodes every
+  cached frame, so the window only moves when the new data actually falls outside
+  it. A run that stays within its existing range costs one `/api/meta` round trip
+  and the new frames, nothing else.
+
+If you were sitting on the last step, refresh follows the new last step, so
+pressing `r` every so often tails a run.
 
 ## Use
 
@@ -115,10 +143,24 @@ python3 rview_server.py /path/to/vti -p 8777          # then tunnel to it
 | drag, wheel | pan, zoom; double-click or **fit** to reset |
 | hover | x, y and the value under the cursor |
 | click | the exact float from the file, not the 8-bit approximation |
+| r, **&#8635;** | re-read the file listing (see below) |
 
 **levels** turns the colormap into N filled contour bands (0 = smooth). It is a
 pure recolour of what is already downloaded, so it costs nothing and applies to
 the image, the colourbar and an exported GIF alike.
+
+**axes** puts tick-labelled x and y around the image, in the file's own
+coordinates: `Origin` and `Spacing` read straight from the `.vti`, mapped with
+the same arithmetic the hover readout uses, so the value you read at a labelled
+coordinate is the one that belongs there. Ticks hang off the data's own frame
+and follow pan and zoom, clamping into the margin when you zoom past an edge;
+**on + grid** adds faint lines across the image. A `.vti` carries no units, so
+the labels never claim any — long coordinates factor out a shared power of ten
+(`x  ×10³`) rather than being relabelled km.
+
+The axes are a screen overlay. **save PNG** still writes the data raster at its
+served resolution and a GIF is rendered on the data host, so neither carries
+them.
 
 **relief** drapes the field over a hillshade computed on the data host from any
 scalar in the collection, usually `bed` or `srf` — the equivalent of ParaView's
