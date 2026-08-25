@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+
+# a local config is per-machine; the example is the tracked one
+rview.toml

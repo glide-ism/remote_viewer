@@ -1,0 +1,15 @@
+# Copy to rview.toml here, or to ~/.config/rview/config.toml, and edit.
+# Every setting is optional and can be overridden on the command line.
+
+# Directory of .pvd collections. May be a local path or an sshfs mount --
+# if it is a mount, rview finds the real host and path and runs the reducer there.
+directory = "/path/to/vti"
+
+# port = 8777
+# coll = "icefield"        # collection to open first
+# range_frames = 0         # cap the timesteps a value-range scan reads (0 = all)
+# timeout = 60             # seconds to wait for the server to come up
+
+# Only needed when the data is NOT reachable through a local mount:
+# host = "mybox"
+# remote_dir = "/data/vti"

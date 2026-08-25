@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""
+rview -- open the lightweight VTI viewer for a directory of .pvd collections.
+
+The data never crosses the network in bulk: the reduction server is shipped to
+and run on the host that owns the files, and only an ssh tunnel and small
+colormapped frames come back.  A local directory is served in place.
+
+    rview /path/to/vti           # local, or on an sshfs mount (host auto-detected)
+    rview --host box --remote-dir /data/vti    # remote without a local mount
+    rview --coll icefield        # open straight to one collection
+    rview --local                # read through the mount instead of over ssh (slow)
+    rview --show-config          # print where each setting came from, then exit
+
+Settings come from, in order of precedence: command line, environment
+(RVIEW_DIR, RVIEW_HOST, RVIEW_REMOTE_DIR, RVIEW_PORT, RVIEW_COLL), a config
+file, then built-in defaults.  With nothing specified at all, a single sshfs
+mount is used if there is exactly one.
+
+Config file, first of $RVIEW_CONFIG, ./rview.toml,
+$XDG_CONFIG_HOME/rview/config.toml, ~/.config/rview/config.toml:
+
+    directory = "/path/to/vti"              # local path, may be an sshfs mount
+    port = 8777
+    coll = "icefield"
+    # only needed when the data is not reachable through a local mount:
+    # host = "mybox"
+    # remote_dir = "/data/vti"
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import webbrowser
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SERVER = os.path.join(HERE, "rview_server.py")
+REMOTE_COPY = "~/.cache/rview/rview_server.py"
+CONFIG_NAME = "rview.toml"
+SETTINGS = ("directory", "host", "remote_dir", "port", "coll", "range_frames",
+            "local", "no_browser", "timeout")
+DEFAULTS = {"port": 8777, "range_frames": 0, "local": False,
+            "no_browser": False, "timeout": 60.0}
+SSH_OPTS = [
+    "-o", "ExitOnForwardFailure=yes",   # fail loudly instead of tunnelling nowhere
+    "-o", "ServerAliveInterval=30",     # this link drops; notice and die rather than hang
+    "-o", "ServerAliveCountMax=3",
+    "-C",                               # helps the html/json; images are already compressed
+]
+
+
+def config_paths(explicit: str | None) -> list[str]:
+    if explicit:
+        return [os.path.expanduser(explicit)]
+    env = os.environ.get("RVIEW_CONFIG")
+    if env:
+        return [os.path.expanduser(env)]
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return [os.path.abspath(CONFIG_NAME),
+            os.path.join(xdg, "rview", "config.toml"),
+            os.path.join(os.path.expanduser("~"), ".config", "rview", "config.toml")]
+
+
+def load_config(explicit: str | None) -> tuple[dict, str | None]:
+    """First config file that exists wins. Returns (settings, path)."""
+    for path in config_paths(explicit):
+        if not os.path.isfile(path):
+            continue
+        try:
+            import tomllib
+        except ImportError:                       # python < 3.11
+            raise SystemExit(f"{path}: reading a config file needs python 3.11+ "
+                             "(or pass the settings on the command line)")
+        try:
+            with open(path, "rb") as fh:
+                raw = tomllib.load(fh)
+        except Exception as exc:
+            raise SystemExit(f"{path}: {exc}")
+        unknown = [k for k in raw if k not in SETTINGS]
+        if unknown:
+            raise SystemExit(f"{path}: unknown setting(s) {', '.join(sorted(unknown))}; "
+                             f"known settings are {', '.join(SETTINGS)}")
+        return raw, path
+    if explicit:
+        raise SystemExit(f"no such config file: {explicit}")
+    return {}, None
+
+
+ENV_KEYS = {"directory": "RVIEW_DIR", "host": "RVIEW_HOST",
+            "remote_dir": "RVIEW_REMOTE_DIR", "port": "RVIEW_PORT", "coll": "RVIEW_COLL"}
+
+
+def resolve_settings(args, cfg: dict) -> tuple[dict, dict]:
+    """Merge command line over environment over config over defaults.
+
+    Also returns where each value came from, which is what --show-config prints.
+    """
+    out, origin = {}, {}
+    for key in SETTINGS:
+        cli = getattr(args, key, None)
+        if cli not in (None, False):              # store_true flags default to False
+            out[key], origin[key] = cli, "command line"
+            continue
+        env = os.environ.get(ENV_KEYS.get(key, ""), None) if key in ENV_KEYS else None
+        if env not in (None, ""):
+            out[key], origin[key] = env, f"${ENV_KEYS[key]}"
+            continue
+        if key in cfg:
+            out[key], origin[key] = cfg[key], "config file"
+            continue
+        if key in DEFAULTS:
+            out[key], origin[key] = DEFAULTS[key], "default"
+        else:
+            out[key], origin[key] = None, "unset"
+    for key, cast in (("port", int), ("range_frames", int), ("timeout", float)):
+        try:
+            out[key] = cast(out[key])
+        except (TypeError, ValueError):
+            raise SystemExit(f"{key} must be a number, got {out[key]!r}")
+    return out, origin
+
+
+def sshfs_mounts() -> list[tuple[str, str, str]]:
+    """[(mountpoint, host, remote_root)] for every fuse.sshfs mount, longest first."""
+    out = []
+    try:
+        with open("/proc/mounts") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3 or parts[2] != "fuse.sshfs":
+                    continue
+                src, mnt = parts[0], parts[1].replace("\\040", " ")
+                host, _, root = src.partition(":")
+                if host and root:
+                    out.append((os.path.normpath(mnt), host, root.rstrip("/")))
+    except OSError:
+        pass
+    return sorted(out, key=lambda m: -len(m[0]))
+
+
+def resolve(path: str):
+    """Map a local path to (host, remote_dir) if it sits on an sshfs mount."""
+    p = os.path.normpath(os.path.abspath(path))
+    for mnt, host, root in sshfs_mounts():
+        if p == mnt or p.startswith(mnt + os.sep):
+            rel = os.path.relpath(p, mnt)
+            return host, (root if rel == "." else root + "/" + rel.replace(os.sep, "/"))
+    return None, p
+
+
+def port_free(port: int) -> bool:
+    # SO_REUSEADDR matches what ssh and the server itself do, so lingering
+    # TIME_WAIT sockets from a previous run do not read as "busy".
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def local_build() -> str:
+    import hashlib
+    with open(SERVER, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()[:12]
+
+
+def probe(port: int, timeout: float = 1.0):
+    """Return an answering rview server's {dir, build}, or None."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/meta", timeout=timeout) as r:
+            import json
+            m = json.load(r)
+            return {"dir": m.get("dir"), "build": m.get("build")}
+    except Exception:
+        return None
+
+
+def reap_stale_tunnel(port: int) -> bool:
+    """Drop an rview ssh tunnel that still holds the port but has no server behind it.
+
+    A dropped link can leave the local ssh alive while the remote server is gone.
+    Hopping to another port would work but silently changes the URL, so clear the
+    corpse instead. Matching is narrow: an rview tunnel forwarding this exact port.
+    """
+    try:
+        out = subprocess.run(["pgrep", "-af", "ssh"], capture_output=True, text=True).stdout
+    except Exception:
+        return False
+    killed = False
+    for line in out.splitlines():
+        pid, _, cmd = line.partition(" ")
+        if f"-L 127.0.0.1:{port}:" in cmd and "cache/rview" in cmd:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+                killed = True
+            except (ProcessLookupError, ValueError, PermissionError):
+                pass
+    if killed:
+        for _ in range(20):
+            if port_free(port):
+                return True
+            time.sleep(0.25)
+    return killed
+
+
+def kill_stale(host: str, port: int) -> None:
+    """Drop a server left behind by an earlier run, so a fresh one can bind.
+
+    The bracket in the pattern stops pkill from matching the ssh command that
+    carries it, which would otherwise kill this very connection.
+    """
+    pat = f"[r]view_server[.]py.* -p {port}( |$)"
+    if host is None:
+        subprocess.run(["pkill", "-f", pat], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(["ssh", *SSH_OPTS, host, f"pkill -f '{pat}' || true"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(20):
+        if probe(port, 0.5) is None:
+            return
+        time.sleep(0.25)
+
+
+def wait_ready(port: int, proc: subprocess.Popen, timeout: float):
+    # Probing before the remote server has bound makes ssh print a
+    # "channel N: open failed" line for every attempt, so start gently.
+    time.sleep(1.5)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return None
+        d = probe(port, 1.0)
+        if d is not None:
+            return d
+        time.sleep(0.35)
+    return None
+
+
+def push_server(host: str) -> None:
+    """Copy the server to the remote host every time -- it is only ~55 kB."""
+    with open(SERVER, "rb") as fh:
+        payload = fh.read()
+    cmd = ["ssh", *SSH_OPTS, host,
+           "mkdir -p ~/.cache/rview && cat > ~/.cache/rview/rview_server.py.tmp "
+           "&& mv ~/.cache/rview/rview_server.py.tmp ~/.cache/rview/rview_server.py"]
+    p = subprocess.run(cmd, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise SystemExit(f"could not copy the server to {host}:\n{p.stderr.decode().strip()}")
+
+
+def choose_target(st: dict):
+    """Work out (ssh host, directory on that host) from the settings.
+
+    Returns (None, path) to serve locally, or (None, None) after printing why it
+    could not decide.
+    """
+    if st["host"]:                                  # explicit remote, no mount needed
+        target = st["remote_dir"] or st["directory"]
+        if not target:
+            print("--host needs --remote-dir (or a directory) to say what to serve",
+                  file=sys.stderr)
+            return None, None
+        return st["host"], target
+
+    directory = st["directory"]
+    if not directory:
+        mounts = sshfs_mounts()
+        if len(mounts) == 1:
+            directory = mounts[0][0]
+            print(f"[rview] no directory given; using the only sshfs mount, {directory}")
+        elif mounts:
+            print("no directory given, and several sshfs mounts to choose from:",
+                  file=sys.stderr)
+            for mnt, h, root in mounts:
+                print(f"    {mnt}  ->  {h}:{root}", file=sys.stderr)
+            print("pass one as an argument, or set 'directory' in a config file",
+                  file=sys.stderr)
+            return None, None
+        else:
+            print("no directory given. Pass one as an argument, set RVIEW_DIR, or put\n"
+                  "  directory = \"/path/to/vti\"\n"
+                  "in a config file (see --help for where those live).", file=sys.stderr)
+            return None, None
+
+    if not os.path.isdir(directory) and not st["local"]:
+        # only a warning: the path may exist only on the remote side
+        if not sshfs_mounts():
+            print(f"warning: {directory} is not a directory here", file=sys.stderr)
+    if st["local"]:
+        return None, os.path.abspath(directory)
+    if st["remote_dir"]:
+        print("remote_dir is only used together with host; ignoring it", file=sys.stderr)
+    return resolve(directory)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("directory", nargs="?", default=None,
+                    help="directory holding the .pvd files (local, possibly an sshfs mount)")
+    ap.add_argument("-c", "--config", default=None, metavar="PATH",
+                    help="config file to read instead of the usual locations")
+    ap.add_argument("-p", "--port", type=int, default=None)
+    ap.add_argument("--coll", default=None, help="collection to open first")
+    ap.add_argument("--host", default=None,
+                    help="ssh host holding the data; normally read off the sshfs mount")
+    ap.add_argument("--remote-dir", default=None,
+                    help="path on --host, when the data is not mounted locally")
+    ap.add_argument("--local", action="store_true",
+                    help="serve the path directly, even if it is an sshfs mount (slow)")
+    ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--range-frames", type=int, default=None, metavar="N",
+                    help="cap how many timesteps a value-range scan reads (default all)")
+    ap.add_argument("--timeout", type=float, default=None, help="seconds to wait for startup")
+    ap.add_argument("--show-config", action="store_true",
+                    help="print the resolved settings and where each came from, then exit")
+    args = ap.parse_args()
+
+    cfg, cfg_path = load_config(args.config)
+    st, origin = resolve_settings(args, cfg)
+
+    if args.show_config:
+        print(f"config file: {cfg_path or '(none found)'}")
+        for key in SETTINGS:
+            print(f"  {key:12s} {str(st[key]):40s} <- {origin[key]}")
+        host, target = choose_target(st)
+        if host is None and target is None:
+            return 2
+        print(f"\nresolves to: {host + ':' + target if host else target + '  (served locally)'}")
+        return 0
+
+    if not os.path.exists(SERVER):
+        return print(f"missing {SERVER}", file=sys.stderr) or 2
+
+    host, remote_dir = choose_target(st)
+    if host is None and remote_dir is None:
+        return 2
+    if host and not shutil.which("ssh"):
+        return print("ssh not found on PATH", file=sys.stderr) or 2
+
+    # Reuse a server that is already listening rather than stacking tunnels.
+    port = st["port"]
+    mine = local_build()
+    if not port_free(port):
+        running = probe(port)
+        if running is not None and running.get("build") == mine and running.get("dir") == remote_dir:
+            print(f"[rview] reusing the server already on :{port} ({running['dir']})")
+            url = f"http://127.0.0.1:{port}/" + (f"?coll={st['coll']}" if st["coll"] else "")
+            if not st["no_browser"]:
+                webbrowser.open(url)
+            print(f"[rview] {url}")
+            return 0
+        if running is not None:
+            why = "a different directory" if running.get("build") == mine else "an older build"
+            print(f"[rview] a server on :{port} is serving {why}; replacing it")
+            kill_stale(host, port)
+        elif reap_stale_tunnel(port):
+            print(f"[rview] cleared a stale tunnel that was holding :{port}")
+        while not port_free(port) and port < st["port"] + 50:
+            port += 1
+        if port != st["port"]:
+            print(f"[rview] port {st['port']} is busy, using {port}")
+
+    range_args = ["--range-frames", str(st["range_frames"])] if st["range_frames"] else []
+
+    if host is None:
+        print(f"[rview] serving {remote_dir} locally")
+        cmd = [sys.executable, SERVER, remote_dir, "-p", str(port), *range_args]
+    else:
+        print(f"[rview] data lives on {host}:{remote_dir} -- running the reducer there")
+        # A server left over from an earlier run would hold the port on the remote
+        # side and quietly answer through the new tunnel.
+        kill_stale(host, port)
+        push_server(host)
+        # ssh without a tty does not signal the remote command when it goes away,
+        # which would strand the server on the data host. Parking a reader on the
+        # remote stdin fixes that: closing this end -- on Ctrl-C, on a dropped
+        # link, even if the launcher is killed outright -- lands as EOF there.
+        remote_cmd = (
+            f"python3 {REMOTE_COPY} {shell_quote(remote_dir)} "
+            f"-p {port} --host 127.0.0.1 " + " ".join(range_args) + " & "
+            "SRV=$!; trap 'kill $SRV 2>/dev/null' EXIT INT TERM HUP; "
+            "cat > /dev/null; kill $SRV 2>/dev/null"
+        )
+        cmd = ["ssh", *SSH_OPTS, "-L", f"127.0.0.1:{port}:127.0.0.1:{port}", host, remote_cmd]
+
+    # stdin is the watchdog channel for the remote server (see remote_cmd), and
+    # keeping it off the terminal stops ssh competing for the user's keystrokes.
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    # Without this a SIGTERM to the launcher would orphan the ssh tunnel, which
+    # then keeps answering on the port with a server nobody is managing.
+    def _bye(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _bye)
+
+    try:
+        served = wait_ready(port, proc, st["timeout"])
+        if served is None:
+            if proc.poll() is None:
+                proc.terminate()
+                print(f"[rview] gave up waiting {st["timeout"]:.0f}s for the server", file=sys.stderr)
+            else:
+                print(f"[rview] the server exited (status {proc.returncode}); see the messages above",
+                      file=sys.stderr)
+            return 1
+        url = f"http://127.0.0.1:{port}/" + (f"?coll={st['coll']}" if st["coll"] else "")
+        print(f"[rview] ready: {url}\n[rview] serving {served}\n[rview] Ctrl-C to stop")
+        if not st["no_browser"]:
+            webbrowser.open(url)
+        proc.wait()
+    except KeyboardInterrupt:
+        print("\n[rview] shutting down")
+    finally:
+        if proc.poll() is None:
+            try:                      # EOF first: lets the remote shut itself down
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+    return 0
+
+
+def shell_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
